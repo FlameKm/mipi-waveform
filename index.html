@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIPI D-PHY 波形：一条数据线的多帧节奏</title>
+<meta name="description" content="用可以自由缩放的交互波形，把一条 MIPI D-PHY 数据线的多帧传输节奏摊开讲清楚。">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="masthead">
+  <p class="eyebrow">MIPI D-PHY · 多帧波形</p>
+  <h1>这条线到底在忙什么</h1>
+  <p class="lede">
+    探头夹在一条 MIPI 数据线上，看到的不是一整片方波，而是一串连绵的 burst，中间夹着整齐的空白：
+    帧起始一个短包，然后每行一个长包，最后帧结束，然后干等一段时间再重来。
+    下面摊开三帧真实的 CSI-2 图像数据，远看是节奏，近看是方波，再近就是一个比特。
+  </p>
+</header>
+
+<main>
+
+  <section class="instrument" aria-label="波形示波区">
+    <div class="toolbar">
+      <label class="field">
+        <span class="field-name">速率</span>
+        <select id="sel-rate"></select>
+      </label>
+      <label class="field">
+        <span class="field-name">帧数</span>
+        <select id="sel-frames"></select>
+      </label>
+      <label class="field">
+        <span class="field-name">每帧行数</span>
+        <select id="sel-lines"></select>
+      </label>
+      <label class="field">
+        <span class="field-name">每行字节</span>
+        <select id="sel-payload"></select>
+      </label>
+      <label class="field">
+        <span class="field-name">帧间隙</span>
+        <select id="sel-vblank"></select>
+      </label>
+      <label class="field field-switch">
+        <input type="checkbox" id="chk-escape">
+        <span class="field-name">带一段逃逸</span>
+      </label>
+      <button type="button" class="btn-ghost" id="btn-reset">复位视图</button>
+    </div>
+
+    <div class="jumpbar" id="jumpbar">
+      <span class="jumpbar-label">跳到</span>
+      <button type="button" data-focus="all" data-which="0">全程</button>
+      <button type="button" data-focus="frame" data-which="0">一帧</button>
+      <button type="button" data-focus="frameStart" data-which="0">帧起始</button>
+      <button type="button" data-focus="line" data-which="0">一行</button>
+      <button type="button" data-focus="sync" data-which="0">同步头</button>
+      <button type="button" data-focus="frameEnd" data-which="0">帧结束</button>
+      <button type="button" data-focus="vblank" data-which="0">帧间隙</button>
+      <button type="button" data-focus="escape" data-which="0">逃逸</button>
+      <span class="jumpbar-tip">滚轮缩放 · 拖拽平移 · 双击复位</span>
+    </div>
+
+    <div class="screen">
+      <canvas id="scope"></canvas>
+    </div>
+
+    <div class="readout" id="readout">
+      <div class="readout-item">
+        <span class="readout-key">时刻</span>
+        <span class="readout-val" id="ro-time">—</span>
+      </div>
+      <div class="readout-item">
+        <span class="readout-key">位置</span>
+        <span class="readout-val" id="ro-where">—</span>
+      </div>
+      <div class="readout-item">
+        <span class="readout-key">此刻</span>
+        <span class="readout-val" id="ro-state">把鼠标移到波形上</span>
+      </div>
+      <div class="readout-item">
+        <span class="readout-key">Dp</span>
+        <span class="readout-val" id="ro-dp">—</span>
+      </div>
+      <div class="readout-item">
+        <span class="readout-key">Dn</span>
+        <span class="readout-val" id="ro-dn">—</span>
+      </div>
+      <div class="readout-item">
+        <span class="readout-key">差分</span>
+        <span class="readout-val" id="ro-diff">—</span>
+      </div>
+      <div class="readout-item">
+        <span class="readout-key">时基</span>
+        <span class="readout-val" id="ro-timebase">—</span>
+      </div>
+      <div class="readout-item readout-measure">
+        <span class="readout-key">测量</span>
+        <span class="readout-val" id="ro-measure">按住 Shift 拖一下，量任意两点的间隔</span>
+      </div>
+    </div>
+
+    <div class="overview">
+      <canvas id="overview"></canvas>
+      <p class="overview-hint">上面这条是全程缩略图，方框标着当前看到的位置，可以直接拖它。</p>
+    </div>
+  </section>
+
+  <section class="chapters">
+
+    <article class="chapter" data-focus="all">
+      <h2><span class="idx">01</span>这条线一整天在干什么</h2>
+      <p>
+        一帧图像不是一口气传完的。它被打包成：<b>帧起始</b>、然后<b>一行一包</b>、最后<b>帧结束</b>。
+        包与包之间、帧与帧之间，线是松开的——两根线都停在 1.2V，这叫 <b>LP-11</b>，也就是“歇着”。
+      </p>
+      <p>
+        所以探头搭上去看到的不是一条连续方波，而是一串连绵的 burst，中间夹着整齐的空白。
+        你现在看到的是三帧：每帧那一大片密集的竖线是数据在跑，中间那几段长长的平地是帧间隙。
+      </p>
+      <p class="tip">动手：把“每帧行数”调到 32，波形会挤成三条“毛刷”。这就是真实探头上看到的样子。</p>
+    </article>
+
+    <article class="chapter" data-focus="frameStart">
+      <h2><span class="idx">02</span>帧的两头：两个短包</h2>
+      <p>
+        帧起始和帧结束都是短包，只有四个字节：数据标识、帧号、校验。
+        它们不传图像，只负责告诉接收端“新的一帧开始了”和“这帧完了”。
+      </p>
+      <p>
+        短包短到什么程度？几百纳秒。在一帧几毫秒的尺度里，它细得像根头发。
+        但少了它，接收端就不知道该怎么把后面那几百行长包拼成一张完整的图。
+      </p>
+      <p class="tip">动手：点“帧起始”，再往上滚两格，能看到四个字段被细线分开。</p>
+    </article>
+
+    <article class="chapter" data-focus="line">
+      <h2><span class="idx">03</span>一行数据：长包</h2>
+      <p>
+        长包比短包多两样东西：两字节的<b>字长</b>，和末尾两字节的<b>校验</b>。中间那段就是这一行的像素数据。
+      </p>
+      <p>
+        一个长包完整的一生是这样的：从 LP-11 里出来，先握手，再稳定，再同步，然后一口气把数据推完，
+        收尾，回到 LP-11。<b>包与包之间必须回到 LP-11</b>，这是协议规定的，不能包挨着包连着发。
+      </p>
+      <p class="tip">动手：点“一行”，整包的结构一次看全，上面的色带标了每个阶段。</p>
+    </article>
+
+    <article class="chapter" data-focus="request">
+      <h2><span class="idx">04</span>发数据前得先握手</h2>
+      <p>
+        要从 1.2V 的单端信号切到 200mV 的差分信号，不能悄悄切过去。所以先拉成 <b>LP-01</b>，停一段最短 50ns；
+        再拉到 <b>LP-00</b>，再停一段。
+      </p>
+      <p>
+        这两拍的意思很直白：第一拍说“注意，我要提速了”，第二拍说“我准备好了，你把接收机打开”。
+        接收端必须在这点时间里完成终端电阻切换和共模电压建立，所以这两个下限写死在规范里。
+      </p>
+      <p class="tip">动手：点上面的“一行”，把光标停在 burst 开头，读数会告诉你此刻是 LP-01 还是 LP-00。</p>
+    </article>
+
+    <article class="chapter" data-focus="zero">
+      <h2><span class="idx">05</span>稳定期为什么这么长</h2>
+      <p>
+        进了高速也不急着发数据，先要把差分硬拉成 0，保持至少 105 纳秒再加 12 个比特时间。
+        看着像浪费，其实是给驱动器偏置和线路反射留安顿的时间。
+      </p>
+      <p>
+        接收端会一直盯着这根线，等它<b>连续 8 个比特都是 0</b> 才认定“稳了”，然后开始找同步头。
+      </p>
+      <p class="tip">动手：这里有个反直觉的点——这段稳定期<b>每一个包前面都有</b>。包越小，它的开销占比越高。</p>
+    </article>
+
+    <article class="chapter" data-focus="sync">
+      <h2><span class="idx">06</span>同步头：八个零后面那串</h2>
+      <p>
+        稳定期之后是固定的一串：<code>00011101</code>。
+        连同前面一路的 0 一起，接收端看到的是一长串 0 突然变成 0-0-0-1-1-1-0-1，这个跳变就是字节边界的锚点。
+      </p>
+      <p>
+        为什么不干脆用全 1？因为连续的 0 之后那个上跳最难认错。
+        接收端的状态机会拿这 8 位跟固定图案比对，对不上就报同步错误、整包扔掉——这是抓波形最常见的故障之一。
+      </p>
+      <p class="tip">动手：跳到同步头，紫色那块底子就是它，上面标了每一位的 0 和 1。</p>
+    </article>
+
+    <article class="chapter" data-focus="escape">
+      <h2><span class="idx">07</span>低速那条路</h2>
+      <p>
+        数据发完了，有时候还得往回说点话，比如读寄存器。方向反了，走不了高速通道。
+        办法是回到 <b>LP-11</b> 之后拉成 <b>LP-10</b> 作为入口，绕一圈进逃逸模式。
+      </p>
+      <p>
+        逃逸里每一位用一整段低功耗状态表示：1 用 LP-01，0 用 LP-00，每位 50 纳秒。
+        慢得像老牛拉车，但只占 Dp 一根线的高低，功耗极低，而且能反向跑。
+      </p>
+      <p class="tip">动手：勾上“带一段逃逸”，波形尾部会多出一小段，点“逃逸”跳过去。</p>
+    </article>
+
+    <article class="chapter" data-focus="vblank">
+      <h2><span class="idx">08</span>拿探头去测，容易踩的坑</h2>
+      <p>
+        第一个坑是<b>只看一个包</b>。帧级的问题——比如帧间隙太短导致丢帧、行数对不上——在几微秒的时基里永远看不出来，
+        必须把时基拉到毫秒级，让整帧缩成一根毛刷。
+      </p>
+      <p>
+        第二个坑是<b>垂直量程</b>。二百毫伏的差分摆幅放在零点几伏的量程里就是一条粗线，怎么调都看不清。
+        要么拉开水平缩放，要么换差分探头。
+      </p>
+      <p>
+        第三个坑是<b>地线</b>。探头那根黑夹子太长形成环路，量出来的边沿全是振铃——
+        你以为是芯片驱动能力差，其实是探头自己接进来的噪声。测这种信号，地弹簧比探头本身还重要。
+      </p>
+    </article>
+
+  </section>
+
+  </section>
+
+  <section class="reference">
+    <h2>关键时序参数</h2>
+    <p class="reference-note">
+      数值取自 D-PHY 1.x 的公开下限。不同版本和不同厂商会在这个基础上加码，
+      实际配参请以你手上芯片的收发器手册为准。
+    </p>
+    <table>
+      <thead>
+        <tr><th>参数</th><th>这一段是什么</th><th>下限</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>T-LPX</td><td>低功耗状态的最短持续时间</td><td>50 ns</td></tr>
+        <tr><td>T-HS-PREPARE</td><td>LP-00 到差分拉 0 之间的准备时间</td><td>40 ns + 4 UI</td></tr>
+        <tr><td>T-HS-ZERO</td><td>差分保持 0 的稳定期，接收端靠它锁相</td><td>105 ns + 12 UI</td></tr>
+        <tr><td>T-HS-TRAIL</td><td>最后一个比特之后的收尾保持</td><td>60 ns + 4 UI</td></tr>
+        <tr><td>T-HS-EXIT</td><td>回到 LP-11 后继续等待的时间</td><td>100 ns</td></tr>
+        <tr><td>UI</td><td>一个比特的时间，等于速率的倒数</td><td>由速率决定</td></tr>
+        <tr><td>T-HS-SETTLE</td><td>从 LP-00 到差分稳定之间，接收端滤掉的那一段</td><td>由接收端能力决定</td></tr>
+      </tbody>
+    </table>
+    <p class="reference-note">
+      上面这些是<b>每个包</b>都要付的固定开销。一行 32 字节的包，握手加稳定加收尾就占掉一半以上的时间；
+      行越长，这笔开销摊得越薄。所以真实的图像传感器能用长行就用长行。
+    </p>
+  </section>
+
+  <footer class="colophon">
+    <p>
+      页面里的电平是理想化画法，省掉了上升下降时间、过冲和抖动。真实探头看到的边沿有圆角，
+      稳定期里还有肉眼看不见的噪声——那些才是调试时真正要盯的东西。
+    </p>
+    <p>
+      帧间隙的长度不是协议规定的，它由帧率和行长倒推出来。这里按“帧数据时长 × 系数”估算，
+      只影响观感，不影响任何一个包内部的结构。
+    </p>
+  </footer>
+
+</main>
+
+<script src="js/model.js"></script>
+<script src="js/render.js"></script>
+<script src="js/interaction.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
