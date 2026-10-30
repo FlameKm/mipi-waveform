@@ -159,25 +159,33 @@
       return event.clientX - canvas.getBoundingClientRect().left;
     }
 
+    let wheelPrev_ms = 0;
+    let wheelBurst = 1;
+
     canvas.addEventListener(
       'wheel',
       (event) => {
         event.preventDefault();
 
         /* 时间跨度从整帧的几十毫秒到单个比特的几百皮秒，跨了六个数量级。
-         * 单次滚动放小步保证精度，连着滚就自动加速，不然要点几十下才挪得动。 */
+         * 单次滚动保持小步，缩放才跟手；连着滚才慢慢加速，不然要点几十下才挪得动。
+         * 加速上限压到 1.6，再高就成了一段一段地跳，看着像卡。 */
         const now_ms = performance.now();
-        wheelBurst = now_ms - wheelPrev_ms < 140 ? Math.min(2.4, wheelBurst * 1.2) : 1;
+        const isBursting = now_ms - wheelPrev_ms < 160;
+        wheelBurst = isBursting ? Math.min(1.6, wheelBurst * 1.12) : 1;
         wheelPrev_ms = now_ms;
 
-        const factor = Math.exp(event.deltaY * 0.0021 * wheelBurst);
-        zoomAt(localX(event), factor);
+        /* 有的浏览器按行给 delta，有的驱动一次给好几百，不收拾会跳过头 */
+        const rawDelta = event.deltaMode === 1 ? event.deltaY * 40 : event.deltaY;
+        const delta = Math.max(-160, Math.min(160, rawDelta));
+
+        /* 触控板捏合会被浏览器伪装成按住 ctrl 的滚轮，delta 只有个位数。
+         * 用滚轮的系数去乘，捏十下才动 15%，手上一片死区——这就是"缩放卡住"的来源。 */
+        const gain = event.ctrlKey ? 0.012 : 0.0019 * wheelBurst;
+        zoomAt(localX(event), Math.exp(delta * gain));
       },
       { passive: false }
     );
-
-    let wheelPrev_ms = 0;
-    let wheelBurst = 1;
 
     canvas.addEventListener('pointerdown', (event) => {
       const x = localX(event);

@@ -110,6 +110,15 @@
 
   /* ---------- 读数 ---------- */
 
+  /* 每帧都要刷一遍读数，内容没变就别碰 DOM，省下不必要的样式重算 */
+  function setText(el, text) {
+    if (el.textContent !== text) el.textContent = text;
+  }
+
+  function setMuted(el, isMuted) {
+    el.classList.toggle('is-muted', isMuted);
+  }
+
   function updateReadout(step_ns) {
     const view = interaction.getView();
     const cursor_ns = interaction.getCursor_ns();
@@ -120,37 +129,39 @@
     const info = isInside ? model.describeAt(timeline, cursor_ns) : null;
 
     if (!info) {
-      dom.roTime.textContent = '—';
-      dom.roWhere.textContent = '—';
-      dom.roWhere.classList.add('is-muted');
-      dom.roState.textContent = '把鼠标移到波形上';
-      dom.roState.classList.add('is-muted');
-      dom.roDp.textContent = '—';
-      dom.roDn.textContent = '—';
-      dom.roDiff.textContent = '—';
+      setText(dom.roTime, '—');
+      setText(dom.roWhere, '—');
+      setMuted(dom.roWhere, true);
+      setText(dom.roState, '把鼠标移到波形上');
+      setMuted(dom.roState, true);
+      setText(dom.roDp, '—');
+      setText(dom.roDn, '—');
+      setText(dom.roDiff, '—');
     } else {
-      dom.roTime.textContent = model.formatTime_ns(cursor_ns);
-      dom.roWhere.textContent = info.where || '空闲';
-      dom.roWhere.classList.toggle('is-muted', !info.where);
-      dom.roState.textContent = info.detail ? `${info.title} · ${info.detail}` : info.title;
-      dom.roState.classList.remove('is-muted');
-      dom.roDp.textContent = model.formatVoltage_v(info.dp_v);
-      dom.roDn.textContent = model.formatVoltage_v(info.dn_v);
-      dom.roDiff.textContent = model.formatVoltage_v(info.dp_v - info.dn_v);
+      setText(dom.roTime, model.formatTime_ns(cursor_ns));
+      setText(dom.roWhere, info.where || '空闲');
+      setMuted(dom.roWhere, !info.where);
+      setText(dom.roState, info.detail ? `${info.title} · ${info.detail}` : info.title);
+      setMuted(dom.roState, false);
+      setText(dom.roDp, model.formatVoltage_v(info.dp_v));
+      setText(dom.roDn, model.formatVoltage_v(info.dn_v));
+      setText(dom.roDiff, model.formatVoltage_v(info.dp_v - info.dn_v));
     }
 
-    dom.roTimebase.textContent = `每格 ${model.formatTime_ns(step_ns)}`;
+    setText(dom.roTimebase, `每格 ${model.formatTime_ns(step_ns)}`);
 
     const marks = interaction.getMarks();
     if (marks.length === 2) {
       const delta_ns = Math.abs(marks[1] - marks[0]);
       const uiCount = delta_ns / timeline.ui_ns;
-      dom.roMeasure.textContent =
-        `${model.formatTime_ns(delta_ns)}　=　${uiCount < 10 ? uiCount.toFixed(2) : uiCount.toFixed(1)} 个比特时间`;
-      dom.roMeasure.classList.remove('is-muted');
+      setText(
+        dom.roMeasure,
+        `${model.formatTime_ns(delta_ns)}　=　${uiCount < 10 ? uiCount.toFixed(2) : uiCount.toFixed(1)} 个比特时间`
+      );
+      setMuted(dom.roMeasure, false);
     } else {
-      dom.roMeasure.textContent = '按住 Shift 拖一下，量任意两点的间隔';
-      dom.roMeasure.classList.add('is-muted');
+      setText(dom.roMeasure, '按住 Shift 拖一下，量任意两点的间隔');
+      setMuted(dom.roMeasure, true);
     }
   }
 

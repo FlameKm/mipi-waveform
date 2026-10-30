@@ -207,11 +207,35 @@
   /* 全局看是"帧起始 / 行 / 帧间隙"，放大到单个包才展开成握手、同步、数据这些阶段 */
   const STAGE_EXPAND_MIN_PX = 190;
 
-  function drawPhaseRibbon(ctx, layout, timeline, scale, view) {
+  function drawPhaseRibbon(ctx, layout, timeline, scale, visiblePackets) {
     const top = layout.ribbonTop;
     const height = layout.ribbonHeight;
 
-    for (const item of model.packetsIn(timeline, view.t0_ns, view.t0_ns + view.span_ns)) {
+    /* 一千多行时这里有一千多个包，逐个 fillRect 光调用开销就好几毫秒。
+     * 按颜色攒成 Path2D，一种颜色只填一次，缩放的响应速度就差在这。 */
+    const fillPaths = new Map();
+    const edgePaths = new Map();
+    const labels = [];
+
+    const collect = (x0, x1, style, label) => {
+      if (!style) return;
+      const w = Math.max(0.8, x1 - x0);
+
+      const fill = fillPaths.get(style.color) || new Path2D();
+      fill.rect(x0, top, w, height);
+      fillPaths.set(style.color, fill);
+
+      /* 窄到一像素就别再描边了，几百条边线叠起来就是一块糊 */
+      if (x1 - x0 > 2) {
+        const edge = edgePaths.get(style.color) || new Path2D();
+        edge.rect(x0, top, 1.5, height);
+        edgePaths.set(style.color, edge);
+      }
+
+      if (label && x1 - x0 > 42) labels.push({ x0, x1, style, label });
+    };
+
+    for (const item of visiblePackets) {
       const x0 = Math.max(layout.plotLeft, scale.xOf_ns(item.start_ns));
       const x1 = Math.min(layout.plotRight, scale.xOf_ns(item.end_ns));
       const w = x1 - x0;
@@ -225,13 +249,28 @@
           const sx0 = Math.max(layout.plotLeft, scale.xOf_ns(stage.start_ns));
           const sx1 = Math.min(layout.plotRight, scale.xOf_ns(stage.end_ns));
           const stageStyle = model.STAGE_STYLE[stage.key];
-          paintRibbonBlock(ctx, sx0, sx1, top, height, stageStyle, stageStyle && stageStyle.name);
+          collect(sx0, sx1, stageStyle, stageStyle && stageStyle.name);
         }
         continue;
       }
 
-      paintRibbonBlock(ctx, x0, x1, top, height, model.PACKET_STYLE[item.kind], item.label, w);
+      collect(x0, x1, model.PACKET_STYLE[item.kind], item.label);
     }
+
+    ctx.save();
+    ctx.globalAlpha = 0.14;
+    for (const [color, path] of fillPaths) {
+      ctx.fillStyle = color;
+      ctx.fill(path);
+    }
+    ctx.restore();
+
+    for (const [color, path] of edgePaths) {
+      ctx.fillStyle = color;
+      ctx.fill(path);
+    }
+
+    for (const { x0, x1, style, label } of labels) paintRibbonLabel(ctx, x0, x1, top, height, style, label);
 
     ctx.save();
     ctx.strokeStyle = '#e3e8ef';
@@ -243,34 +282,19 @@
     ctx.restore();
   }
 
-  function paintRibbonBlock(ctx, x0, x1, top, height, style, label, totalWidth) {
+  /* 块够宽时把阶段名写进去，写不下就不写 */
+  function paintRibbonLabel(ctx, x0, x1, top, height, style, label) {
     const w = x1 - x0;
-    if (w < 0.2 || !style) return;
-
     ctx.save();
-    ctx.globalAlpha = 0.14;
+    ctx.beginPath();
+    ctx.rect(x0 + 4, top, Math.max(0, w - 6), height);
+    ctx.clip();
     ctx.fillStyle = style.color;
-    ctx.fillRect(x0, top, Math.max(0.8, w), height);
+    ctx.font = '11px system-ui, -apple-system, "PingFang SC", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, x0 + 6, top + height / 2 + 0.5);
     ctx.restore();
-
-    /* 窄到一像素就别再描边了，几百条边线叠起来就是一块糊 */
-    if (w > 2) {
-      ctx.fillStyle = style.color;
-      ctx.fillRect(x0, top, 1.5, height);
-    }
-
-    if (label && w > 42) {
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(x0 + 4, top, Math.max(0, w - 6), height);
-      ctx.clip();
-      ctx.fillStyle = style.color;
-      ctx.font = '11px system-ui, -apple-system, "PingFang SC", sans-serif';
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(label, x0 + 6, top + height / 2 + 0.5);
-      ctx.restore();
-    }
   }
 
   /* ---------- 字段条 ---------- */
@@ -278,10 +302,10 @@
   const FIELD_COLORS = ['#2563eb', '#7c3aed', '#0891b2', '#0f9d58', '#e2571f'];
   const FIELD_MIN_PACKET_PX = 150;
 
-  function drawFieldBar(ctx, layout, timeline, scale, view) {
+  function drawFieldBar(ctx, layout, timeline, scale, view, visiblePackets) {
     const top = layout.fieldTop;
 
-    for (const packet of model.packetsIn(timeline, view.t0_ns, view.t0_ns + view.span_ns)) {
+    for (const packet of visiblePackets) {
       if (!packet.fields) continue;
 
       /* 一屏里有几十个包时，每个包都标字段只会糊成一片 */
@@ -355,13 +379,13 @@
   /* ---------- 波形 ---------- */
 
   /* 放大到每个比特都站得住脚时，逐比特画方波 */
-  function drawDetailedTrace(ctx, layout, box, timeline, scale, view) {
+  function drawDetailedTrace(ctx, layout, box, timeline, scale, view, visibleSegs) {
     const { min_v, max_v } = box.channel;
     const channels = box.channel;
     const intervals = [];
     let hasClipped = false;
 
-    for (const seg of model.segmentsIn(timeline, view.t0_ns, view.t0_ns + view.span_ns)) {
+    for (const seg of visibleSegs) {
       if (seg.kind === 'lp') {
         intervals.push({ start_ns: seg.start_ns, end_ns: seg.end_ns, v: channels.pickLp(seg) });
         continue;
@@ -418,10 +442,9 @@
   }
 
   /* 缩小时一屏塞进上万比特，逐比特画又慢又看不清，按像素列取电平上下限就够了 */
-  function drawAggregatedTrace(ctx, layout, box, timeline, scale, view) {
+  function drawAggregatedTrace(ctx, layout, box, timeline, scale, view, segments) {
     const { min_v, max_v } = box.channel;
     const channel = box.channel;
-    const segments = model.segmentsIn(timeline, view.t0_ns, view.t0_ns + view.span_ns);
     if (segments.length === 0) return { hasClipped: false };
 
     let hasClipped = false;
@@ -500,15 +523,15 @@
     return { hasClipped };
   }
 
-  function drawChannelTrace(ctx, layout, box, timeline, scale, view) {
+  function drawChannelTrace(ctx, layout, box, timeline, scale, view, visibleSegs) {
     const pxPerBit = timeline.ui_ns * scale.pxPer_ns;
     return pxPerBit < 1.2
-      ? drawAggregatedTrace(ctx, layout, box, timeline, scale, view)
-      : drawDetailedTrace(ctx, layout, box, timeline, scale, view);
+      ? drawAggregatedTrace(ctx, layout, box, timeline, scale, view, visibleSegs)
+      : drawDetailedTrace(ctx, layout, box, timeline, scale, view, visibleSegs);
   }
 
   /* 把低功耗状态名直接写在波形上，省得每次回头对照色带 */
-  function drawLpStateLabels(ctx, layout, timeline, scale, view) {
+  function drawLpStateLabels(ctx, layout, timeline, scale, visibleSegs) {
     const box = layout.channelBoxes[0];
     const minWidth_px = 44;
 
@@ -520,7 +543,7 @@
 
     let previousState = null;
 
-    for (const seg of model.segmentsIn(timeline, view.t0_ns, view.t0_ns + view.span_ns)) {
+    for (const seg of visibleSegs) {
       if (seg.kind !== 'lp') {
         previousState = null;
         continue;
@@ -540,7 +563,7 @@
   }
 
   /* 放大到能分清每个比特时，把 0 和 1 标在差分通道顶上 */
-  function drawBitLabels(ctx, layout, timeline, scale, view) {
+  function drawBitLabels(ctx, layout, timeline, scale, view, visibleSegs) {
     const box = layout.channelBoxes[layout.channelBoxes.length - 1];
     const minBitWidth_px = 13;
     const y = box.top + 13;
@@ -550,7 +573,7 @@
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
-    for (const seg of model.segmentsIn(timeline, view.t0_ns, view.t0_ns + view.span_ns)) {
+    for (const seg of visibleSegs) {
       if (seg.kind !== 'hs') continue;
       if (seg.stageKey === 'zero' || seg.stageKey === 'trail') continue;
 
@@ -593,16 +616,13 @@
   }
 
   /* 高速段的单端摆幅只有 200mV，放在 0~1.4V 的量程里就是贴地一条线，点一句省得误会 */
-  function drawSwingHint(ctx, layout, timeline, view, visiblePackets) {
+  function drawSwingHint(ctx, layout, visibleSegs, visiblePackets) {
     /* 窄屏上这行字会直接压在波形上，宁可不提示 */
     if (layout.plotWidth < 620) return;
     /* 几百个包挤在一起时整条通道全是竖线，提示文字也没有落脚的地方 */
     if (visiblePackets.length > 24) return;
 
-    const hasHs = model
-      .segmentsIn(timeline, view.t0_ns, view.t0_ns + view.span_ns)
-      .some((seg) => seg.kind === 'hs');
-    if (!hasHs) return;
+    if (!visibleSegs.some((seg) => seg.kind === 'hs')) return;
 
     ctx.save();
     ctx.fillStyle = '#b3bcc9';
@@ -755,25 +775,31 @@
     drawGrid(ctx, layout, scale, opts.view);
     drawChannelFrames(ctx, layout);
 
+    /* 视口内的段和包只捞一次，七个绘制函数共用。
+     * 各自捞一遍的话，1080p 一帧要新建一万四千个临时对象，缩放时全砸在 GC 上。 */
+    const t0_ns = opts.view.t0_ns;
+    const t1_ns = t0_ns + opts.view.span_ns;
+    const visibleSegs = model.segmentsIn(opts.timeline, t0_ns, t1_ns);
+    const visiblePackets = model.packetsIn(opts.timeline, t0_ns, t1_ns);
+
     for (const box of layout.channelBoxes) {
-      const result = drawChannelTrace(ctx, layout, box, opts.timeline, scale, opts.view);
+      const result = drawChannelTrace(ctx, layout, box, opts.timeline, scale, opts.view, visibleSegs);
       if (result.hasClipped) drawClippingBadge(ctx, layout, box);
     }
 
-    const visiblePackets = model.packetsIn(opts.timeline, opts.view.t0_ns, opts.view.t0_ns + opts.view.span_ns);
     /* 帧间隙也是宽块，但它没有字段可标，不能算进来 */
     const hasWidePacket = visiblePackets.some(
       (packet) =>
         packet.fields && scale.xOf_ns(packet.end_ns) - scale.xOf_ns(packet.start_ns) > FIELD_MIN_PACKET_PX
     );
 
-    drawLpStateLabels(ctx, layout, opts.timeline, scale, opts.view);
-    drawBitLabels(ctx, layout, opts.timeline, scale, opts.view);
-    drawPhaseRibbon(ctx, layout, opts.timeline, scale, opts.view);
-    if (hasWidePacket) drawFieldBar(ctx, layout, opts.timeline, scale, opts.view);
+    drawLpStateLabels(ctx, layout, opts.timeline, scale, visibleSegs);
+    drawBitLabels(ctx, layout, opts.timeline, scale, opts.view, visibleSegs);
+    drawPhaseRibbon(ctx, layout, opts.timeline, scale, visiblePackets);
+    if (hasWidePacket) drawFieldBar(ctx, layout, opts.timeline, scale, opts.view, visiblePackets);
     else drawFrameMarkers(ctx, layout, opts.timeline, scale, opts.view);
     drawTimeAxis(ctx, layout, scale, opts.view);
-    drawSwingHint(ctx, layout, opts.timeline, opts.view, visiblePackets);
+    drawSwingHint(ctx, layout, visibleSegs, visiblePackets);
     drawCursor(ctx, layout, scale, opts.cursor_ns, opts.marks);
 
     return { layout, step_ns: timeStep_nsFor(layout.plotWidth, opts.view.span_ns) };
@@ -781,10 +807,33 @@
 
   /* ---------- 缩略图 ---------- */
 
-  function drawOverview(ctx, opts) {
-    const { width, height, timeline, view } = opts;
-    ctx.clearRect(0, 0, width, height);
+  /* 缩略图的波形只跟时间线有关，缩放平移时它一点没变。
+   * 缓存到离屏画布，每帧只把视口方框挪一下，省掉几万段的重新扫描。 */
+  let overviewCache = null;
 
+  function ensureOverviewBase(width, height, timeline) {
+    if (
+      overviewCache &&
+      overviewCache.timeline === timeline &&
+      overviewCache.width === width &&
+      overviewCache.height === height
+    ) {
+      return overviewCache.canvas;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(width * dpr));
+    canvas.height = Math.max(1, Math.round(height * dpr));
+    const offCtx = canvas.getContext('2d');
+    offCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    drawOverviewBase(offCtx, width, height, timeline);
+    overviewCache = { canvas, timeline, width, height };
+    return canvas;
+  }
+
+  function drawOverviewBase(ctx, width, height, timeline) {
     const padX = 2;
     const padY = 6;
     const usableW = width - padX * 2;
@@ -862,6 +911,21 @@
     }
     ctx.stroke();
     ctx.restore();
+  }
+
+  function drawOverview(ctx, opts) {
+    const { width, height, timeline, view } = opts;
+    ctx.clearRect(0, 0, width, height);
+
+    /* 波形部分走缓存，只有视口方框是每帧现画的 */
+    ctx.drawImage(ensureOverviewBase(width, height, timeline), 0, 0, width, height);
+
+    const padX = 2;
+    const padY = 6;
+    const usableW = width - padX * 2;
+    const usableH = height - padY * 2;
+    const duration = Math.max(1, timeline.duration_ns);
+    const xOf = (t) => padX + (t / duration) * usableW;
 
     /* 当前视口 */
     const vx0 = Math.max(padX, xOf(view.t0_ns));
