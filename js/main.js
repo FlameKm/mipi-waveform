@@ -11,11 +11,13 @@
   const dom = {
     scope: document.getElementById('scope'),
     overview: document.getElementById('overview'),
-    selRate: document.getElementById('sel-rate'),
+    selResolution: document.getElementById('sel-resolution'),
+    selFormat: document.getElementById('sel-format'),
+    selLanes: document.getElementById('sel-lanes'),
+    selClock: document.getElementById('sel-clock'),
+    inpHBlank: document.getElementById('inp-hblank'),
+    inpVBlank: document.getElementById('inp-vblank'),
     selFrames: document.getElementById('sel-frames'),
-    selLines: document.getElementById('sel-lines'),
-    selPayload: document.getElementById('sel-payload'),
-    selVblank: document.getElementById('sel-vblank'),
     chkEscape: document.getElementById('chk-escape'),
     btnReset: document.getElementById('btn-reset'),
     jumpbar: document.getElementById('jumpbar'),
@@ -27,14 +29,25 @@
     roMeasure: document.getElementById('ro-measure'),
     roTimebase: document.getElementById('ro-timebase'),
     roWhere: document.getElementById('ro-where'),
+    bdFps: document.getElementById('bd-fps'),
+    bdBytes: document.getElementById('bd-bytes'),
+    bdActive: document.getElementById('bd-active'),
+    bdLine: document.getElementById('bd-line'),
+    bdFrame: document.getElementById('bd-frame'),
+    bdDuty: document.getElementById('bd-duty'),
+    bdLink: document.getElementById('bd-link'),
   };
 
+  /* 默认为 720p30 量级的真实配置：4 lane、每条 100 Mbps，链路刚够用 */
   const params = {
-    rate_bps: 1e9,
+    clockLane_mhz: 50,
+    laneCount: 4,
+    formatKey: 'RAW10',
+    width_px: 1280,
+    height_px: 720,
+    hblank_px: 200,
+    vblank_lines: 40,
     frameCount: 3,
-    linesPerFrame: 4,
-    payloadLen_bytes: 64,
-    vblankKey: 'normal',
     isEscaping: false,
     seed: 1,
   };
@@ -141,6 +154,29 @@
     }
   }
 
+  /* ---------- 带宽预算 ---------- */
+
+  function formatBytes(bytes) {
+    return bytes >= 1024 ? `${(bytes / 1024).toFixed(2)} KB` : `${bytes} B`;
+  }
+
+
+  function formatBandwidth(bps) {
+    if (bps >= 1e9) return `${(bps / 1e9).toFixed(2)} Gbps`;
+    return `${Math.round(bps / 1e6)} Mbps`;
+  }
+
+  function updateBudget() {
+    const t = timeline;
+    dom.bdFps.textContent = `${t.fps.toFixed(1)} fps`;
+    dom.bdBytes.textContent = `${formatBytes(t.lineBytes_bytes)} · ${t.perLaneBytes_bytes} B`;
+    dom.bdActive.textContent = model.formatTime_ns(t.lineActive_ns);
+    dom.bdLine.textContent = model.formatTime_ns(t.linePeriod_ns);
+    dom.bdFrame.textContent = model.formatTime_ns(t.framePeriod_ns);
+    dom.bdDuty.textContent = `${t.dutyPercent.toFixed(1)}%`;
+    dom.bdLink.textContent = `${formatBandwidth(t.bitRate_bps)} × ${t.laneCount}`;
+  }
+
   /* ---------- 参数面板 ---------- */
 
   function fillSelect(select, values, format, valueOf) {
@@ -153,14 +189,17 @@
     }
   }
 
-  const formatRate = (bps) => (bps >= 1e9 ? `${bps / 1e9} Gbps` : `${bps / 1e6} Mbps`);
+  const resolutionKeyOf = (p) => `${p.width_px}x${p.height_px}`;
+  const findResolution = (key) => model.RESOLUTIONS.find((r) => r.key === key) || model.RESOLUTIONS[3];
 
   function syncParamInputs() {
-    dom.selRate.value = String(params.rate_bps);
+    dom.selResolution.value = resolutionKeyOf(params);
+    dom.selFormat.value = params.formatKey;
+    dom.selLanes.value = String(params.laneCount);
+    dom.selClock.value = String(params.clockLane_mhz);
+    dom.inpHBlank.value = String(params.hblank_px);
+    dom.inpVBlank.value = String(params.vblank_lines);
     dom.selFrames.value = String(params.frameCount);
-    dom.selLines.value = String(params.linesPerFrame);
-    dom.selPayload.value = String(params.payloadLen_bytes);
-    dom.selVblank.value = params.vblankKey;
     dom.chkEscape.checked = params.isEscaping;
 
     for (const button of dom.jumpbar.querySelectorAll('[data-focus="escape"]')) {
@@ -171,9 +210,12 @@
   function rebuild() {
     timeline = model.build(params);
     interaction.setTimeline(timeline);
-    /* 速率和载荷一改，整条时间线的尺度全变了，停在旧视口只会看到空白 */
-    interaction.fitAll(false);
+    /* 参数一改，整条时间线的尺度全变了，停在旧视口只会看到空白。
+     * 但直接铺全程也不合适：一帧七百多行压进一千像素就是一块实心，
+     * 所以先落在开头十行上，看得见包的结构，要看帧的节奏点上面的按钮。 */
+    interaction.focusRange(0, Math.min(timeline.duration_ns, timeline.linePeriod_ns * 10), false);
     syncParamInputs();
+    updateBudget();
     requestDraw();
   }
 
@@ -206,33 +248,54 @@
 
   /* ---------- 启动 ---------- */
 
-  fillSelect(dom.selRate, model.RATE_CHOICES_BPS, formatRate);
+  fillSelect(dom.selResolution, model.RESOLUTIONS, (r) => `${r.width_px}×${r.height_px}`, (r) => r.key);
+  fillSelect(dom.selFormat, model.FORMATS, (f) => `${f.label}（${f.bitsPerPixel} bit/像素）`, (f) => f.key);
+  fillSelect(dom.selLanes, model.LANE_CHOICES, (n) => `${n} 条`);
+  fillSelect(dom.selClock, model.CLOCK_LANE_CHOICES_MHZ, (mhz) => `${mhz} MHz`);
   fillSelect(dom.selFrames, model.FRAME_CHOICES, (n) => `${n} 帧`);
-  fillSelect(dom.selLines, model.LINES_CHOICES, (n) => `${n} 行`);
-  fillSelect(dom.selPayload, model.PAYLOAD_CHOICES_BYTES, (n) => `${n} 字节`);
-  fillSelect(dom.selVblank, model.VBLANK_CHOICES, (c) => c.label, (c) => c.key);
 
-  dom.selRate.addEventListener('change', (event) => {
-    params.rate_bps = Number(event.target.value);
+  dom.selResolution.addEventListener('change', (event) => {
+    const preset = findResolution(event.target.value);
+    params.width_px = preset.width_px;
+    params.height_px = preset.height_px;
+    /* 每档分辨率的消隐典型值差得远，切过去就一起换掉 */
+    params.hblank_px = preset.hblank_px;
+    params.vblank_lines = preset.vblank_lines;
     rebuild();
   });
+
+  dom.selFormat.addEventListener('change', (event) => {
+    params.formatKey = event.target.value;
+    params.seed = (params.seed + 7) % 100000;
+    rebuild();
+  });
+
+  dom.selLanes.addEventListener('change', (event) => {
+    params.laneCount = Number(event.target.value);
+    rebuild();
+  });
+
+  dom.selClock.addEventListener('change', (event) => {
+    params.clockLane_mhz = Number(event.target.value);
+    rebuild();
+  });
+
+  /* 数字框用 change 而不是 input，否则每敲一位就重铺一遍几万段的时间线 */
+  dom.inpHBlank.addEventListener('change', (event) => {
+    params.hblank_px = Math.max(0, Number(event.target.value) || 0);
+    rebuild();
+  });
+
+  dom.inpVBlank.addEventListener('change', (event) => {
+    params.vblank_lines = Math.max(2, Number(event.target.value) || 2);
+    rebuild();
+  });
+
   dom.selFrames.addEventListener('change', (event) => {
     params.frameCount = Number(event.target.value);
     rebuild();
   });
-  dom.selLines.addEventListener('change', (event) => {
-    params.linesPerFrame = Number(event.target.value);
-    rebuild();
-  });
-  dom.selPayload.addEventListener('change', (event) => {
-    params.payloadLen_bytes = Number(event.target.value);
-    params.seed = (params.seed + 7) % 100000;
-    rebuild();
-  });
-  dom.selVblank.addEventListener('change', (event) => {
-    params.vblankKey = event.target.value;
-    rebuild();
-  });
+
   dom.chkEscape.addEventListener('change', (event) => {
     params.isEscaping = event.target.checked;
     rebuild();

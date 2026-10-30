@@ -163,11 +163,21 @@
       'wheel',
       (event) => {
         event.preventDefault();
-        const factor = Math.exp(event.deltaY * 0.0016);
+
+        /* 时间跨度从整帧的几十毫秒到单个比特的几百皮秒，跨了六个数量级。
+         * 单次滚动放小步保证精度，连着滚就自动加速，不然要点几十下才挪得动。 */
+        const now_ms = performance.now();
+        wheelBurst = now_ms - wheelPrev_ms < 140 ? Math.min(2.4, wheelBurst * 1.2) : 1;
+        wheelPrev_ms = now_ms;
+
+        const factor = Math.exp(event.deltaY * 0.0021 * wheelBurst);
         zoomAt(localX(event), factor);
       },
       { passive: false }
     );
+
+    let wheelPrev_ms = 0;
+    let wheelBurst = 1;
 
     canvas.addEventListener('pointerdown', (event) => {
       const x = localX(event);

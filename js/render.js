@@ -215,7 +215,10 @@
       const x0 = Math.max(layout.plotLeft, scale.xOf_ns(item.start_ns));
       const x1 = Math.min(layout.plotRight, scale.xOf_ns(item.end_ns));
       const w = x1 - x0;
-      if (w < 1) continue;
+      if (w < 0.2) continue;
+
+      /* 一千多行挤进来时，行间隙还不到一个像素，画出来只会把绿色切成锯齿 */
+      if (item.kind === 'lineGap' && w < 1.5) continue;
 
       if (item.stages && w > STAGE_EXPAND_MIN_PX) {
         for (const stage of item.stages) {
@@ -242,16 +245,19 @@
 
   function paintRibbonBlock(ctx, x0, x1, top, height, style, label, totalWidth) {
     const w = x1 - x0;
-    if (w < 0.5 || !style) return;
+    if (w < 0.2 || !style) return;
 
     ctx.save();
     ctx.globalAlpha = 0.14;
     ctx.fillStyle = style.color;
-    ctx.fillRect(x0, top, w, height);
+    ctx.fillRect(x0, top, Math.max(0.8, w), height);
     ctx.restore();
 
-    ctx.fillStyle = style.color;
-    ctx.fillRect(x0, top, 1.5, height);
+    /* 窄到一像素就别再描边了，几百条边线叠起来就是一块糊 */
+    if (w > 2) {
+      ctx.fillStyle = style.color;
+      ctx.fillRect(x0, top, 1.5, height);
+    }
 
     if (label && w > 42) {
       ctx.save();
@@ -362,10 +368,10 @@
       }
       const step = seg.ui_ns;
       const first = Math.max(0, Math.floor((view.t0_ns - seg.start_ns) / step));
-      const last = Math.min(seg.bits.length, Math.ceil((view.t0_ns + view.span_ns - seg.start_ns) / step));
+      const last = Math.min(seg.bitCount, Math.ceil((view.t0_ns + view.span_ns - seg.start_ns) / step));
       for (let i = first; i < last; i++) {
         const start_ns = seg.start_ns + i * step;
-        intervals.push({ start_ns, end_ns: start_ns + step, v: channels.pickBit(seg.bits[i]) });
+        intervals.push({ start_ns, end_ns: start_ns + step, v: channels.pickBit(model.bitAt(seg, i)) });
       }
     }
 
@@ -451,11 +457,21 @@
           continue;
         }
 
+        /* 一个像素里塞了不止一个比特时，高低电平必然都出现过，直接给满量程。
+         * 不这么写的话 1080p 一行就要走一万九千次循环，一帧渲染能卡住几十毫秒。 */
+        if (seg.ui_ns <= t1_ns - t0_ns) {
+          const a = channel.pickBit(0);
+          const b = channel.pickBit(1);
+          if (Math.min(a, b) < lo) lo = Math.min(a, b);
+          if (Math.max(a, b) > hi) hi = Math.max(a, b);
+          continue;
+        }
+
         const step = seg.ui_ns;
         const first = Math.max(0, Math.floor((t0_ns - seg.start_ns) / step));
-        const last = Math.min(seg.bits.length, Math.ceil((t1_ns - seg.start_ns) / step));
+        const last = Math.min(seg.bitCount, Math.ceil((t1_ns - seg.start_ns) / step));
         for (let i = first; i < last; i++) {
-          const v = channel.pickBit(seg.bits[i]);
+          const v = channel.pickBit(model.bitAt(seg, i));
           if (v < lo) lo = v;
           if (v > hi) hi = v;
         }
@@ -542,13 +558,13 @@
       if (bitWidth_px < minBitWidth_px) continue;
 
       const first = Math.max(0, Math.floor((view.t0_ns - seg.start_ns) / seg.ui_ns));
-      const last = Math.min(seg.bits.length, Math.ceil((view.t0_ns + view.span_ns - seg.start_ns) / seg.ui_ns));
+      const last = Math.min(seg.bitCount, Math.ceil((view.t0_ns + view.span_ns - seg.start_ns) / seg.ui_ns));
 
       for (let i = first; i < last; i++) {
         const cx = scale.xOf_ns(seg.start_ns + (i + 0.5) * seg.ui_ns);
         if (cx < layout.plotLeft + 5 || cx > layout.plotRight - 5) continue;
 
-        const bit = seg.bits[i];
+        const bit = model.bitAt(seg, i);
         /* 同步头垫一层紫色底，因为它和前面一长串 0 长得一模一样，不标出来根本分不出界线 */
         if (seg.stageKey === 'sync') {
           ctx.fillStyle = bit ? 'rgba(124, 58, 237, 0.16)' : 'rgba(124, 58, 237, 0.07)';
@@ -577,9 +593,11 @@
   }
 
   /* 高速段的单端摆幅只有 200mV，放在 0~1.4V 的量程里就是贴地一条线，点一句省得误会 */
-  function drawSwingHint(ctx, layout, timeline, view) {
+  function drawSwingHint(ctx, layout, timeline, view, visiblePackets) {
     /* 窄屏上这行字会直接压在波形上，宁可不提示 */
     if (layout.plotWidth < 620) return;
+    /* 几百个包挤在一起时整条通道全是竖线，提示文字也没有落脚的地方 */
+    if (visiblePackets.length > 24) return;
 
     const hasHs = model
       .segmentsIn(timeline, view.t0_ns, view.t0_ns + view.span_ns)
@@ -755,7 +773,7 @@
     if (hasWidePacket) drawFieldBar(ctx, layout, opts.timeline, scale, opts.view);
     else drawFrameMarkers(ctx, layout, opts.timeline, scale, opts.view);
     drawTimeAxis(ctx, layout, scale, opts.view);
-    drawSwingHint(ctx, layout, opts.timeline, opts.view);
+    drawSwingHint(ctx, layout, opts.timeline, opts.view, visiblePackets);
     drawCursor(ctx, layout, scale, opts.cursor_ns, opts.marks);
 
     return { layout, step_ns: timeStep_nsFor(layout.plotWidth, opts.view.span_ns) };
@@ -821,11 +839,18 @@
           continue;
         }
 
+        /* 和主画布同一个道理：一列跨了多个比特，高低电平就都算上 */
+        if (seg.ui_ns <= t1_ns - t0_ns) {
+          if (HS_LOW_V < min_v) min_v = HS_LOW_V;
+          if (HS_HIGH_V > max_v) max_v = HS_HIGH_V;
+          continue;
+        }
+
         const step = seg.ui_ns;
         const first = Math.max(0, Math.floor((t0_ns - seg.start_ns) / step));
-        const last = Math.min(seg.bits.length, Math.ceil((t1_ns - seg.start_ns) / step));
+        const last = Math.min(seg.bitCount, Math.ceil((t1_ns - seg.start_ns) / step));
         for (let i = first; i < last; i++) {
-          const v = seg.bits[i] ? HS_HIGH_V : HS_LOW_V;
+          const v = model.bitAt(seg, i) ? HS_HIGH_V : HS_LOW_V;
           if (v < min_v) min_v = v;
           if (v > max_v) max_v = v;
         }

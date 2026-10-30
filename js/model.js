@@ -1,9 +1,16 @@
 /* MIPI D-PHY 波形模型
  *
- * 一条数据线连着的时候，干的事只有一件：一帧接一帧往回搬图像。
- * 每帧 = 帧起始短包 + 每行一个长包 + 帧结束短包，包与包之间、帧与帧之间都是 LP-11 空闲。
+ * 一帧图像传多久不是拍脑袋给的，是从传感器配置反推出来的：
+ *   时钟 lane 频率 × 2        → 比特率
+ *   分辨率 + 数据格式         → 每行多少字节
+ *   lane 数                  → 每条 lane 分到多少字节 → 包有多长
+ *   HBlank / VBlank          → 行周期和帧周期
  *
- * 时间统一用纳秒，电压统一用伏特，变量名带单位后缀。
+ * CSI-2 里没有"消隐波形"这回事：并行 DPI 在消隐期有专门的电平，
+ * 而 CSI-2 是包协议，消隐期就是链路挂在 LP-11 上干等。所以消隐值在这里
+ * 唯一的作用是把行周期和帧周期拉长，空白段因此变宽。
+ *
+ * 时间统一用纳秒，电压用伏特，变量名带单位后缀。
  */
 (function (ns) {
   'use strict';
@@ -29,17 +36,31 @@
   /* 同步头：一长串 0 之后这 8 位就是字节边界的锚点 */
   const SYNC_BITS = Uint8Array.from([0, 0, 0, 1, 1, 1, 0, 1]);
 
-  const RATE_CHOICES_BPS = [80e6, 200e6, 500e6, 1e9, 1.5e9, 2.5e9];
-  const LINES_CHOICES = [4, 8, 16, 32];
-  const PAYLOAD_CHOICES_BYTES = [16, 32, 64, 128];
-  const FRAME_CHOICES = [2, 3, 4];
-
-  /* 帧间隙按帧内数据时长的倍数算，紧凑就是连着发，宽松就是慢帧率 */
-  const VBLANK_CHOICES = [
-    { key: 'tight', label: '紧凑', factor: 0.4 },
-    { key: 'normal', label: '标准', factor: 1.1 },
-    { key: 'loose', label: '宽松', factor: 3.2 },
+  /* 像素格式只关心每像素多少位，打包细节（RAW10 每 4 像素塞 5 字节）先不算 */
+  const FORMATS = [
+    { key: 'RAW8', label: 'RAW8', bitsPerPixel: 8 },
+    { key: 'RAW10', label: 'RAW10', bitsPerPixel: 10 },
+    { key: 'RAW12', label: 'RAW12', bitsPerPixel: 12 },
+    { key: 'RAW14', label: 'RAW14', bitsPerPixel: 14 },
+    { key: 'RGB888', label: 'RGB888', bitsPerPixel: 24 },
+    { key: 'RGB565', label: 'RGB565', bitsPerPixel: 16 },
+    { key: 'YUV422', label: 'YUV422-8', bitsPerPixel: 16 },
   ];
+
+  /* 消隐默认值取各档常见的传感器配置，改分辨率时会一起带过去 */
+  const RESOLUTIONS = [
+    { key: '320x240', width_px: 320, height_px: 240, hblank_px: 60, vblank_lines: 20 },
+    { key: '640x480', width_px: 640, height_px: 480, hblank_px: 120, vblank_lines: 30 },
+    { key: '1280x720', width_px: 1280, height_px: 720, hblank_px: 200, vblank_lines: 40 },
+    { key: '1920x1080', width_px: 1920, height_px: 1080, hblank_px: 280, vblank_lines: 45 },
+    { key: '2560x1440', width_px: 2560, height_px: 1440, hblank_px: 320, vblank_lines: 60 },
+    { key: '3840x2160', width_px: 3840, height_px: 2160, hblank_px: 400, vblank_lines: 80 },
+  ];
+
+  /* D-PHY 时钟 lane 跑 DDR，一个时钟周期送两个比特 */
+  const CLOCK_LANE_CHOICES_MHZ = [50, 100, 200, 300, 400, 500, 750, 1000];
+  const LANE_CHOICES = [1, 2, 4];
+  const FRAME_CHOICES = [2, 3, 4];
 
   /* 以下下限取自 D-PHY 1.x 的公开数值，具体以芯片实际用的版本为准 */
   const T_LPX_NS = 50;
@@ -49,29 +70,24 @@
   const tHsZero_ns = (ui_ns) => 105 + 12 * ui_ns;
   const tHsTrail_ns = (ui_ns) => 60 + 4 * ui_ns;
 
-  const SHORT_PACKET_FIELDS = [
-    { offset: 0, len_bytes: 1, name: '数据标识' },
-    { offset: 1, len_bytes: 2, name: '帧号' },
-    { offset: 3, len_bytes: 1, name: '校验' },
-  ];
+  const findFormat = (key) => FORMATS.find((f) => f.key === key) || FORMATS[1];
 
-  const longPacketFields = (payloadLen_bytes) => [
-    { offset: 0, len_bytes: 1, name: '数据标识' },
-    { offset: 1, len_bytes: 2, name: '字长' },
-    { offset: 3, len_bytes: 1, name: '校验' },
-    { offset: 4, len_bytes: payloadLen_bytes, name: '载荷' },
-    { offset: 4 + payloadLen_bytes, len_bytes: 2, name: 'CRC' },
-  ];
+  /* ---------- 比特的来源 ---------- */
 
-  function mulberry32(seed) {
-    let a = seed >>> 0;
-    return function () {
-      a = (a + 0x6d2b79f5) >>> 0;
-      let t = a;
-      t = Math.imul(t ^ (t >>> 15), t | 1);
-      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
+  /* 载荷是图像数据，内容对波形毫无意义，只要有 0 有 1 就行。
+   * 用确定性哈希按需算，避免给一亿个比特开数组。 */
+  function hashBit(seed, index) {
+    let h = (seed ^ Math.imul(index + 1, 0x9e3779b1)) >>> 0;
+    h = Math.imul(h ^ (h >>> 16), 0x21f0aaad) >>> 0;
+    h = Math.imul(h ^ (h >>> 15), 0x735a2d97) >>> 0;
+    return (h ^ (h >>> 15)) & 1;
+  }
+
+  /** 段的第 index 个比特。恒定段、显式数组、伪随机三种来源统一走这里 */
+  function bitAt(seg, index) {
+    if (seg.bits) return seg.bits[index];
+    if (seg.constantBit !== undefined) return seg.constantBit;
+    return hashBit(seg.prngSeed, index);
   }
 
   function bytesToBits(bytes) {
@@ -83,43 +99,132 @@
     return bits;
   }
 
+  /* ---------- 包的字节内容 ---------- */
+
   /* 帧起始 0x00、帧结束 0x01，都是四字节短包，帧号塞在字长那两格里 */
   function buildFrameShortPacket(dataType, frameIndex) {
-    return [dataType, frameIndex & 0xff, (frameIndex >> 8) & 0xff, 0x00];
+    return Uint8Array.from([dataType, frameIndex & 0xff, (frameIndex >> 8) & 0xff, 0x00]);
   }
 
-  /* 每行一个长包。载荷用行号做种子，所以每行内容都不一样 */
-  function buildLinePacket(frameIndex, lineIndex, payloadLen_bytes, seedBase) {
-    const bytes = [];
-    const push = (v) => bytes.push(v & 0xff);
-
-    push(0x2c); // 虚拟通道 0，类型 0x2C 即 RAW8
-    push(payloadLen_bytes & 0xff);
-    push((payloadLen_bytes >> 8) & 0xff);
-    push(0x00); // 包头校验，示意值
-
-    const rnd = mulberry32(seedBase + frameIndex * 977 + lineIndex * 31);
-    for (let i = 0; i < payloadLen_bytes; i++) push(Math.floor(rnd() * 256));
-
-    push(0x00); // 包尾校验，示意值
-    push(0x00);
-    return bytes;
+  /* 每行一个长包。载荷不生成，只留字节数和种子 */
+  function buildLinePacket(dataType, payloadBytes, lineKey) {
+    return {
+      head: Uint8Array.from([
+        dataType,
+        payloadBytes & 0xff,
+        (payloadBytes >> 8) & 0xff,
+        0x00, // 包头校验，示意值
+      ]),
+      payloadSeed: (lineKey * 2654435761) >>> 0,
+      crc: Uint8Array.from([0x00, 0x00]), // 包尾校验，示意值
+    };
   }
+
+  /* 数据标识：虚拟通道 0 加上各格式的类型码 */
+  const DATA_TYPE_BY_FORMAT = {
+    RAW8: 0x2a,
+    RAW10: 0x2b,
+    RAW12: 0x2c,
+    RAW14: 0x2d,
+    RGB888: 0x24,
+    RGB565: 0x22,
+    YUV422: 0x1e,
+  };
+
+  const SHORT_PACKET_FIELDS = [
+    { part: 'head', offset: 0, len_bytes: 1, name: '数据标识' },
+    { part: 'head', offset: 1, len_bytes: 2, name: '帧号' },
+    { part: 'head', offset: 3, len_bytes: 1, name: '校验' },
+  ];
+
+  const longPacketFields = (payloadBytes) => [
+    { part: 'head', offset: 0, len_bytes: 1, name: '数据标识' },
+    { part: 'head', offset: 1, len_bytes: 2, name: '字长' },
+    { part: 'head', offset: 3, len_bytes: 1, name: '校验' },
+    { part: 'payload', len_bytes: payloadBytes, name: '载荷' },
+    { part: 'crc', offset: 0, len_bytes: 2, name: 'CRC' },
+  ];
 
   /**
-   * 把整条线的行为铺成时间线。
-   * opts: { rate_bps, linesPerFrame, payloadLen_bytes, frameCount, vblankKey, isEscaping, seed }
+   * 从传感器配置反推时间尺度。所有统计口径都在这里定死，页面只负责显示。
+   * opts: { clockLane_mhz, laneCount, formatKey, width_px, height_px,
+   *         hblank_px, vblank_lines, frameCount, isEscaping, seed }
    */
+  function deriveTiming(opts) {
+    const format = findFormat(opts.formatKey);
+    const bitRate_bps = opts.clockLane_mhz * 1e6 * 2;
+    const ui_ns = 1e9 / bitRate_bps;
+
+    /* 每行像素打包成字节，再补上长包的包头 4 字节和包尾 2 字节 */
+    const payloadBytes_bytes = Math.ceil((opts.width_px * format.bitsPerPixel) / 8);
+    const lineBytes_bytes = payloadBytes_bytes + 6;
+
+    /* 字节按 lane 轮转分配，除不尽时 lane 0 多摊一个字节 */
+    const perLaneBytes_bytes = Math.ceil(lineBytes_bytes / opts.laneCount);
+
+    /* 一个包从离开 LP-11 到回到 LP-11 的固定开销，和载荷多少无关 */
+    const overhead_ns =
+      T_LPX_NS +
+      tHsPrepare_ns(ui_ns) +
+      tHsZero_ns(ui_ns) +
+      SYNC_BITS.length * ui_ns +
+      tHsTrail_ns(ui_ns) +
+      T_HS_EXIT_NS;
+
+    const lineActive_ns = overhead_ns + perLaneBytes_bytes * 8 * ui_ns;
+    const shortActive_ns = overhead_ns + Math.ceil(4 / opts.laneCount) * 8 * ui_ns;
+
+    /* 消隐按像素比例把行周期拉长，多出来的时间链路挂在 LP-11 上 */
+    const hTotal_px = opts.width_px + opts.hblank_px;
+    const linePeriod_ns = (lineActive_ns * hTotal_px) / opts.width_px;
+    const lineGap_ns = Math.max(0, linePeriod_ns - lineActive_ns);
+
+    /* VBlank 至少要装得下帧起始和帧结束两个包 */
+    const vblank_lines = Math.max(2, opts.vblank_lines);
+    const vTotal_lines = opts.height_px + vblank_lines;
+    const framePeriod_ns = linePeriod_ns * vTotal_lines;
+
+    /* 帧结束包之后到下一帧起始之间的那一整段空闲 */
+    const vblank_ns = Math.max(0, (vblank_lines - 1) * linePeriod_ns - shortActive_ns);
+
+    return {
+      format,
+      bitRate_bps,
+      ui_ns,
+      laneCount: opts.laneCount,
+      payloadBytes_bytes,
+      lineBytes_bytes,
+      perLaneBytes_bytes,
+      overhead_ns,
+      lineActive_ns,
+      shortActive_ns,
+      lineGap_ns,
+      hTotal_px,
+      vblank_lines,
+      vTotal_lines,
+      linePeriod_ns,
+      framePeriod_ns,
+      vblank_ns,
+      fps: 1e9 / framePeriod_ns,
+      /* 链路真正在传数据的比例：行内活跃时间 × 活跃行数 / 帧周期 */
+      dutyPercent: ((lineActive_ns * opts.height_px) / framePeriod_ns) * 100,
+      linkBandwidth_bps: bitRate_bps * opts.laneCount,
+    };
+  }
+
+  /** 把整条线的行为铺成时间线 */
   function build(opts) {
-    const ui_ns = 1e9 / opts.rate_bps;
+    const timing = deriveTiming(opts);
+    const ui_ns = timing.ui_ns;
     const segments = [];
     const packets = [];
     const frames = [];
+    const dataType = DATA_TYPE_BY_FORMAT[timing.format.key];
     let t_ns = 0;
-
     let currentStageKey = null;
 
     const addLp = (state, dur_ns, label) => {
+      if (dur_ns <= 0) return;
       const [dp_v, dn_v] = LP_LEVEL[state];
       const end_ns = t_ns + dur_ns;
       segments.push({
@@ -135,11 +240,40 @@
       t_ns = end_ns;
     };
 
-    const addHs = (bits, label) => {
+    const pushHs = (end_ns, payload, label) => {
+      segments.push({
+        kind: 'hs',
+        start_ns: t_ns,
+        end_ns,
+        ui_ns,
+        bitCount: Math.round((end_ns - t_ns) / ui_ns),
+        packetLabel: label,
+        stageKey: currentStageKey,
+        ...payload,
+      });
+      t_ns = end_ns;
+    };
+
+    /* 恒定电平段：稳定期和收尾期全是同一个比特，不用开数组 */
+    const addHsConstant = (bitCount, bit, label) => {
+      const start_ns = t_ns;
+      const end_ns = start_ns + bitCount * ui_ns;
+      pushHs(end_ns, { constantBit: bit }, label);
+      return { start_ns, end_ns };
+    };
+
+    const addHsBits = (bits, label) => {
       const start_ns = t_ns;
       const end_ns = start_ns + bits.length * ui_ns;
-      segments.push({ kind: 'hs', bits, start_ns, end_ns, ui_ns, packetLabel: label, stageKey: currentStageKey });
-      t_ns = end_ns;
+      pushHs(end_ns, { bits }, label);
+      return { start_ns, end_ns };
+    };
+
+    /* 图像载荷不落数组，渲染时按需算 */
+    const addHsPayload = (bitCount, prngSeed, label) => {
+      const start_ns = t_ns;
+      const end_ns = start_ns + bitCount * ui_ns;
+      pushHs(end_ns, { prngSeed }, label);
       return { start_ns, end_ns };
     };
 
@@ -171,23 +305,32 @@
 
       /* 差分拉 0 并保持住，让终端电阻和共模电压安顿下来 */
       stage = openStage('zero');
-      addHs(new Uint8Array(Math.max(8, Math.ceil(tHsZero_ns(ui_ns) / ui_ns))), traceLabel);
+      addHsConstant(Math.max(8, Math.ceil(tHsZero_ns(ui_ns) / ui_ns)), 0, traceLabel);
       closeStage(stage);
 
       stage = openStage('sync');
-      addHs(SYNC_BITS, traceLabel);
+      addHsBits(SYNC_BITS, traceLabel);
       closeStage(stage);
+
+      /* 这一条 lane 只摊到整包字节数的 1/N，除不尽的那一位落在 lane 0 上 */
+      const perLane = (len_bytes) => Math.ceil(len_bytes / laneCount);
 
       stage = openStage('data');
       for (const field of meta.fields) {
-        const chunk = payload.slice(field.offset, field.offset + field.len_bytes);
-        const span = addHs(bytesToBits(chunk), traceLabel);
+        const bitsHere = perLane(field.len_bytes) * 8;
+        let span;
+        if (field.part === 'payload') {
+          span = addHsPayload(bitsHere, payload.payloadSeed, traceLabel);
+        } else {
+          const source = field.part === 'crc' ? payload.crc : payload.head;
+          span = addHsBits(bytesToBits(source.slice(0, perLane(source.length))), traceLabel);
+        }
         fields.push({ name: field.name, start_ns: span.start_ns, end_ns: span.end_ns });
       }
       closeStage(stage);
 
       stage = openStage('trail');
-      addHs(new Uint8Array(Math.max(4, Math.ceil(tHsTrail_ns(ui_ns) / ui_ns))), traceLabel);
+      addHsConstant(Math.max(4, Math.ceil(tHsTrail_ns(ui_ns) / ui_ns)), 0, traceLabel);
       closeStage(stage);
 
       stage = openStage('exit');
@@ -212,62 +355,60 @@
       const start_ns = t_ns;
       currentStageKey = null;
       addLp('LP-11', dur_ns, label);
-      packets.push({ kind, label, start_ns, end_ns: t_ns, frameIndex });
+      if (t_ns > start_ns) packets.push({ kind, label, start_ns, end_ns: t_ns, frameIndex });
     };
 
-    const linesPerFrame = opts.linesPerFrame;
-    const payloadLen_bytes = opts.payloadLen_bytes;
     const frameCount = opts.frameCount;
-    const vblankChoice = VBLANK_CHOICES.find((c) => c.key === opts.vblankKey) || VBLANK_CHOICES[1];
-
-    /* 先按规范下限估出各类包的时长，间隙由它推出来，改速率时比例才不会崩 */
-    const shortPayloadBits = 4 * 8;
-    const linePayloadBits = (payloadLen_bytes + 6) * 8;
-    const burstOverhead_ns =
-      T_LPX_NS + tHsPrepare_ns(ui_ns) + tHsZero_ns(ui_ns) + SYNC_BITS.length * ui_ns + tHsTrail_ns(ui_ns) + T_HS_EXIT_NS;
-
-    const shortBurst_ns = burstOverhead_ns + shortPayloadBits * ui_ns;
-    const lineBurst_ns = burstOverhead_ns + linePayloadBits * ui_ns;
-    const lineGap_ns = Math.max(80, lineBurst_ns * 0.45);
-
-    const frameData_ns = (shortBurst_ns + lineGap_ns) * 2 + linesPerFrame * (lineBurst_ns + lineGap_ns);
-    const vblank_ns = Math.max(lineGap_ns, frameData_ns * vblankChoice.factor);
-
-    addGap(lineGap_ns, 'lineGap', '空闲', -1);
+    const laneCount = timing.laneCount;
+    const fields = longPacketFields(timing.payloadBytes_bytes);
+    const headBytes = 4;
 
     for (let f = 0; f < frameCount; f++) {
       const frameStart_ns = t_ns;
       const frameLabel = `帧 ${f + 1}`;
 
-      addBurst(buildFrameShortPacket(0x00, f), {
-        kind: 'frameStart',
-        label: '帧起始',
-        where: `${frameLabel} · 帧起始`,
-        frameIndex: f,
-        fields: SHORT_PACKET_FIELDS,
-      });
-      addGap(lineGap_ns, 'lineGap', '行间隙', f);
+      /* 帧起始住在垂直消隐的开头，占掉一个行周期 */
+      const fs = addBurst(
+        { head: buildFrameShortPacket(0x00, f), payloadSeed: 0, crc: Uint8Array.from([0, 0]) },
+        {
+          kind: 'frameStart',
+          label: '帧起始',
+          where: `${frameLabel} · 帧起始`,
+          frameIndex: f,
+          fields: SHORT_PACKET_FIELDS.map((item) => ({ ...item })),
+        }
+      );
+      addGap(Math.max(0, timing.linePeriod_ns - (fs.end_ns - fs.start_ns)), 'lineGap', '行间隙', f);
 
-      for (let l = 0; l < linesPerFrame; l++) {
-        addBurst(buildLinePacket(f, l, payloadLen_bytes, opts.seed || 1), {
+      for (let l = 0; l < opts.height_px; l++) {
+        const line = addBurst(buildLinePacket(dataType, timing.payloadBytes_bytes, f * 1048576 + l), {
           kind: 'line',
           label: `行 ${l + 1}`,
           where: `${frameLabel} · 第 ${l + 1} 行`,
           frameIndex: f,
           lineIndex: l,
-          fields: longPacketFields(payloadLen_bytes),
+          fields,
         });
-        addGap(lineGap_ns, 'lineGap', '行间隙', f);
+        addGap(timing.lineGap_ns, 'lineGap', '行间隙', f);
+
+        /* 别让帧结束包和最后一个行包挤在一起，节奏要统一 */
+        if (l === opts.height_px - 1) {
+          const pad = timing.linePeriod_ns - (line.end_ns - line.start_ns) - timing.lineGap_ns;
+          if (pad > 0) addGap(pad, 'lineGap', '行间隙', f);
+        }
       }
 
-      addBurst(buildFrameShortPacket(0x01, f), {
-        kind: 'frameEnd',
-        label: '帧结束',
-        where: `${frameLabel} · 帧结束`,
-        frameIndex: f,
-        fields: SHORT_PACKET_FIELDS,
-      });
-      addGap(vblank_ns, 'vblank', '帧间隙', f);
+      const fe = addBurst(
+        { head: buildFrameShortPacket(0x01, f), payloadSeed: 0, crc: Uint8Array.from([0, 0]) },
+        {
+          kind: 'frameEnd',
+          label: '帧结束',
+          where: `${frameLabel} · 帧结束`,
+          frameIndex: f,
+          fields: SHORT_PACKET_FIELDS.map((item) => ({ ...item })),
+        }
+      );
+      addGap(Math.max(0, timing.vblank_ns + (timing.shortActive_ns - (fe.end_ns - fe.start_ns))), 'vblank', '帧间隙', f);
 
       frames.push({ index: f, start_ns: frameStart_ns, end_ns: t_ns });
     }
@@ -288,22 +429,20 @@
       packets.push({ kind: 'escape', label: '逃逸命令', start_ns, end_ns: t_ns, frameIndex: -1, stages });
 
       currentStageKey = null;
-      addLp('LP-11', vblank_ns, '');
-      packets.push({ kind: 'vblank', label: '帧间隙', start_ns: t_ns - vblank_ns, end_ns: t_ns, frameIndex: -1 });
+      const gapStart_ns = t_ns;
+      addLp('LP-11', Math.max(timing.vblank_ns, 400), '');
+      packets.push({ kind: 'vblank', label: '帧间隙', start_ns: gapStart_ns, end_ns: t_ns, frameIndex: -1 });
     }
 
     return {
-      rate_bps: opts.rate_bps,
-      ui_ns,
+      ...timing,
+      headBytes,
       segments,
       packets,
       frames,
       duration_ns: t_ns,
-      lineGap_ns,
-      vblank_ns,
-      linesPerFrame,
-      payloadLen_bytes,
       frameCount,
+      seed: opts.seed || 1,
     };
   }
 
@@ -366,8 +505,9 @@
       };
     }
 
-    const bitIndex = Math.min(seg.bits.length - 1, Math.floor((t_ns - seg.start_ns) / seg.ui_ns));
-    const bit = seg.bits[bitIndex];
+    const rawIndex = Math.floor((t_ns - seg.start_ns) / seg.ui_ns);
+    const bitIndex = Math.max(0, Math.min(seg.bitCount - 1, rawIndex));
+    const bit = bitAt(seg, bitIndex);
     const level = HS_LEVEL[bit];
 
     return {
@@ -440,6 +580,8 @@
 
   ns.model = {
     build,
+    deriveTiming,
+    bitAt,
     segmentsIn,
     packetsIn,
     describeAt,
@@ -447,14 +589,15 @@
     formatTick_ns,
     formatVoltage_v,
     tickStep_ns,
+    findFormat,
     HS_LEVEL,
     LP_LEVEL,
     STAGE_STYLE,
     PACKET_STYLE,
-    RATE_CHOICES_BPS,
-    LINES_CHOICES,
-    PAYLOAD_CHOICES_BYTES,
+    FORMATS,
+    RESOLUTIONS,
+    CLOCK_LANE_CHOICES_MHZ,
+    LANE_CHOICES,
     FRAME_CHOICES,
-    VBLANK_CHOICES,
   };
 })(window.MIPI = window.MIPI || {});

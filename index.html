@@ -10,12 +10,12 @@
 <body>
 
 <header class="masthead">
-  <p class="eyebrow">MIPI D-PHY · 多帧波形</p>
+  <p class="eyebrow">MIPI D-PHY · 从配置推到波形</p>
   <h1>这条线到底在忙什么</h1>
   <p class="lede">
     探头夹在一条 MIPI 数据线上，看到的不是一整片方波，而是一串连绵的 burst，中间夹着整齐的空白：
-    帧起始一个短包，然后每行一个长包，最后帧结束，然后干等一段时间再重来。
-    下面摊开三帧真实的 CSI-2 图像数据，远看是节奏，近看是方波，再近就是一个比特。
+    帧起始一个短包，每行一个长包，帧结束，然后干等一段时间再重来。
+    下面这条线的长度不是估的，是从传感器配置算出来的——改分辨率、lane 数或者消隐，波形就跟着变长变短。
   </p>
 </header>
 
@@ -24,30 +24,69 @@
   <section class="instrument" aria-label="波形示波区">
     <div class="toolbar">
       <label class="field">
-        <span class="field-name">速率</span>
-        <select id="sel-rate"></select>
+        <span class="field-name">分辨率</span>
+        <select id="sel-resolution"></select>
+      </label>
+      <label class="field">
+        <span class="field-name">数据格式</span>
+        <select id="sel-format"></select>
+      </label>
+      <label class="field">
+        <span class="field-name">数据 lane</span>
+        <select id="sel-lanes"></select>
+      </label>
+      <label class="field">
+        <span class="field-name">时钟 lane</span>
+        <select id="sel-clock"></select>
+      </label>
+      <label class="field">
+        <span class="field-name">HBlank</span>
+        <input type="number" id="inp-hblank" min="0" max="8192" step="1" inputmode="numeric">
+      </label>
+      <label class="field">
+        <span class="field-name">VBlank</span>
+        <input type="number" id="inp-vblank" min="2" max="4096" step="1" inputmode="numeric">
       </label>
       <label class="field">
         <span class="field-name">帧数</span>
         <select id="sel-frames"></select>
-      </label>
-      <label class="field">
-        <span class="field-name">每帧行数</span>
-        <select id="sel-lines"></select>
-      </label>
-      <label class="field">
-        <span class="field-name">每行字节</span>
-        <select id="sel-payload"></select>
-      </label>
-      <label class="field">
-        <span class="field-name">帧间隙</span>
-        <select id="sel-vblank"></select>
       </label>
       <label class="field field-switch">
         <input type="checkbox" id="chk-escape">
         <span class="field-name">带一段逃逸</span>
       </label>
       <button type="button" class="btn-ghost" id="btn-reset">复位视图</button>
+    </div>
+
+    <div class="budget" id="budget">
+      <div class="budget-item">
+        <span class="budget-key">帧率上限</span>
+        <span class="budget-val" id="bd-fps">—</span>
+      </div>
+      <div class="budget-item">
+        <span class="budget-key">每行字节</span>
+        <span class="budget-val" id="bd-bytes">—</span>
+      </div>
+      <div class="budget-item">
+        <span class="budget-key">一行传输</span>
+        <span class="budget-val" id="bd-active">—</span>
+      </div>
+      <div class="budget-item">
+        <span class="budget-key">行周期</span>
+        <span class="budget-val" id="bd-line">—</span>
+      </div>
+      <div class="budget-item">
+        <span class="budget-key">帧周期</span>
+        <span class="budget-val" id="bd-frame">—</span>
+      </div>
+      <div class="budget-item">
+        <span class="budget-key">链路忙碌</span>
+        <span class="budget-val" id="bd-duty">—</span>
+      </div>
+      <div class="budget-item">
+        <span class="budget-key">链路带宽</span>
+        <span class="budget-val" id="bd-link">—</span>
+      </div>
     </div>
 
     <div class="jumpbar" id="jumpbar">
@@ -111,16 +150,21 @@
   <section class="chapters">
 
     <article class="chapter" data-focus="all">
-      <h2><span class="idx">01</span>这条线一整天在干什么</h2>
+      <h2><span class="idx">01</span>这条线跑多久，是算出来的</h2>
       <p>
-        一帧图像不是一口气传完的。它被打包成：<b>帧起始</b>、然后<b>一行一包</b>、最后<b>帧结束</b>。
-        包与包之间、帧与帧之间，线是松开的——两根线都停在 1.2V，这叫 <b>LP-11</b>，也就是“歇着”。
+        一帧图像多久传完，不是随手给的。它由四件事定死：<b>分辨率 × 数据格式</b>决定每行多少字节；
+        <b>lane 数</b>决定每条线摊到多少，也就决定了一个包有多长；<b>HBlank / VBlank</b>决定行周期和帧周期；
+        <b>时钟 lane 频率</b>决定比特率，也就是传输速度。
       </p>
       <p>
-        所以探头搭上去看到的不是一条连续方波，而是一串连绵的 burst，中间夹着整齐的空白。
-        你现在看到的是三帧：每帧那一大片密集的竖线是数据在跑，中间那几段长长的平地是帧间隙。
+        上面那排数字就是这套推导的结果。改任何一个，整条波形的长度都会跟着变。
+        注意 CSI-2 里<b>没有消隐波形</b>这回事——并行接口在消隐期有专门的电平，而这里消隐期就是链路挂在 LP-11 上干等，
+        所以消隐值唯一的效果是把空白段拉宽。
       </p>
-      <p class="tip">动手：把“每帧行数”调到 32，波形会挤成三条“毛刷”。这就是真实探头上看到的样子。</p>
+      <p class="tip">
+        动手：把时钟 lane 从 50 MHz 调到 400 MHz，帧率上限从 35 跳到 277，但波形结构一点没变。
+        变的只是每一行在链路上跑完的快慢——这就是为什么配参时带宽算高了纯属白烧功耗。
+      </p>
     </article>
 
     <article class="chapter" data-focus="frameStart">
@@ -145,7 +189,7 @@
         一个长包完整的一生是这样的：从 LP-11 里出来，先握手，再稳定，再同步，然后一口气把数据推完，
         收尾，回到 LP-11。<b>包与包之间必须回到 LP-11</b>，这是协议规定的，不能包挨着包连着发。
       </p>
-      <p class="tip">动手：点“一行”，整包的结构一次看全，上面的色带标了每个阶段。</p>
+      <p class="tip">动手：点“一行”，整包的结构一次看全，上面的色带标了每个阶段。行越长，实心块越宽——一千多个字节挤在几十微秒里，缩着看就是这么一块。</p>
     </article>
 
     <article class="chapter" data-focus="request">
@@ -170,7 +214,10 @@
       <p>
         接收端会一直盯着这根线，等它<b>连续 8 个比特都是 0</b> 才认定“稳了”，然后开始找同步头。
       </p>
-      <p class="tip">动手：这里有个反直觉的点——这段稳定期<b>每一个包前面都有</b>。包越小，它的开销占比越高。</p>
+      <p class="tip">
+        动手：这段稳定期<b>每一个包前面都有</b>，一千多行就是重复一千多遍。
+        包越短，这笔固定开销占的比例越高，所以真实的图像传感器能用长行就用长行。
+      </p>
     </article>
 
     <article class="chapter" data-focus="sync">
@@ -203,14 +250,18 @@
       <h2><span class="idx">08</span>拿探头去测，容易踩的坑</h2>
       <p>
         第一个坑是<b>只看一个包</b>。帧级的问题——比如帧间隙太短导致丢帧、行数对不上——在几微秒的时基里永远看不出来，
-        必须把时基拉到毫秒级，让整帧缩成一根毛刷。
+        必须把时基拉到毫秒级，让整帧缩成一片栅栏。
       </p>
       <p>
         第二个坑是<b>垂直量程</b>。二百毫伏的差分摆幅放在零点几伏的量程里就是一条粗线，怎么调都看不清。
         要么拉开水平缩放，要么换差分探头。
       </p>
       <p>
-        第三个坑是<b>地线</b>。探头那根黑夹子太长形成环路，量出来的边沿全是振铃——
+        第三个坑是<b>只调比特率不看消隐</b>。把时钟 lane 拉高一倍，帧率上去了，
+        但只要 VBlank 也跟着翻倍，帧率会原样掉回来。带宽预算里这两个数是乘在一起的，缺一不可。
+      </p>
+      <p>
+        第四个坑是<b>地线</b>。探头那根黑夹子太长形成环路，量出来的边沿全是振铃——
         你以为是芯片驱动能力差，其实是探头自己接进来的噪声。测这种信号，地弹簧比探头本身还重要。
       </p>
     </article>
@@ -222,7 +273,7 @@
   <section class="reference">
     <h2>关键时序参数</h2>
     <p class="reference-note">
-      数值取自 D-PHY 1.x 的公开下限。不同版本和不同厂商会在这个基础上加码，
+      每个包固定要付的开销，数值取自 D-PHY 1.x 的公开下限。不同版本和不同厂商会在这个基础上加码，
       实际配参请以你手上芯片的收发器手册为准。
     </p>
     <table>
@@ -240,8 +291,19 @@
       </tbody>
     </table>
     <p class="reference-note">
-      上面这些是<b>每个包</b>都要付的固定开销。一行 32 字节的包，握手加稳定加收尾就占掉一半以上的时间；
-      行越长，这笔开销摊得越薄。所以真实的图像传感器能用长行就用长行。
+      上面这些是<b>每个包</b>都要付的固定开销，和载荷多少无关。所以行越长，这笔开销摊得越薄。
+    </p>
+
+    <h2 class="reference-sub">整条线的时长怎么来的</h2>
+    <pre class="reference-formula">每行字节      = ceil(宽 × bit每像素 / 8) + 6
+每 lane 字节  = ceil(每行字节 / lane 数)
+一行传输      = 每 lane 字节 × 8 / 比特率 + 包开销
+行周期        = 一行传输 × (宽 + HBlank) / 宽
+帧周期        = 行周期 × (高 + VBlank)
+帧率上限      = 1 / 帧周期</pre>
+    <p class="reference-note">
+      最后一行的“上限”两个字是关键：这套推导假设链路一刻不停地跑，算出来的是这条链路<b>最高能跑到</b>多少帧。
+      真实配置会留两到三倍余量，所以同样的分辨率，实际帧率通常比这个数字低不少。
     </p>
   </section>
 
@@ -251,8 +313,8 @@
       稳定期里还有肉眼看不见的噪声——那些才是调试时真正要盯的东西。
     </p>
     <p>
-      帧间隙的长度不是协议规定的，它由帧率和行长倒推出来。这里按“帧数据时长 × 系数”估算，
-      只影响观感，不影响任何一个包内部的结构。
+      波形长度是从传感器配置算出来的，不是估的。但页面里的消隐值只用来拉长行周期和帧周期，
+      真实的消隐时序还牵扯到传感器的内部流水线，配参仍以芯片手册为准。
     </p>
   </footer>
 
