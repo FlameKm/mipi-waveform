@@ -17,7 +17,11 @@
 
     const state = {
       timeline: null,
+      /* view 是屏幕上正在显示的，targetView 是滚轮想去的地方。
+       * 鼠标滚轮一格 deltaY 就是 100~120，一步到位会一格一跳，看着像卡。 */
       view: { t0_ns: 0, span_ns: 1 },
+      targetView: { t0_ns: 0, span_ns: 1 },
+      isAnimating: false,
       cursor_ns: null,
       marks: [],
       isPanning: false,
@@ -47,18 +51,33 @@
       return { t0_ns: clamp(view.t0_ns, lo, hi), span_ns };
     }
 
+    /* 画布尺寸只在重排后才会变，没必要每滚一格就去问一次布局。
+     * getBoundingClientRect 会强制同步重排——而它前面刚好是读数栏改 DOM，
+     * 于是每滚一格就重排一次，滚轮越滚越喘。尺寸交给 ResizeObserver 喂。 */
+    let canvasWidth = 0;
+    let canvasHeight = 0;
+    let cachedLayout = null;
+
+    const resizeWatcher = new ResizeObserver((entries) => {
+      const rect = entries[0].contentRect;
+      canvasWidth = rect.width;
+      canvasHeight = rect.height;
+      cachedLayout = null;
+    });
+    resizeWatcher.observe(canvas);
+
     function layoutOf() {
-      const rect = canvas.getBoundingClientRect();
-      return { rect, layout: render.computeLayout(rect.width, rect.height) };
+      if (!cachedLayout) cachedLayout = render.computeLayout(canvasWidth, canvasHeight);
+      return cachedLayout;
     }
 
     function tOfX(x) {
-      const { layout } = layoutOf();
+      const layout = layoutOf();
       return state.view.t0_ns + ((x - layout.plotLeft) / layout.plotWidth) * state.view.span_ns;
     }
 
     function xOfT(t_ns) {
-      const { layout } = layoutOf();
+      const layout = layoutOf();
       return layout.plotLeft + ((t_ns - state.view.t0_ns) / state.view.span_ns) * layout.plotWidth;
     }
 
@@ -69,13 +88,13 @@
       state.timeline = timeline;
       state.marks = [];
       if (isFirst) fitAll(false);
-      else state.view = clampView(state.view);
+      else settleView(clampView(state.targetView));
     }
 
     function fitAll(notify = true) {
       if (!state.timeline) return;
       const dur_ns = state.timeline.duration_ns;
-      state.view = { t0_ns: -dur_ns * 0.015, span_ns: dur_ns * 1.03 };
+      settleView({ t0_ns: -dur_ns * 0.015, span_ns: dur_ns * 1.03 });
       if (notify) onUpdate();
     }
 
@@ -84,7 +103,7 @@
       const width_ns = end_ns - start_ns;
       const span_ns = Math.max(width_ns * ratio, spanLimits().minSpan, minSpan_ns);
       const center_ns = (start_ns + end_ns) / 2;
-      state.view = clampView({ t0_ns: center_ns - span_ns / 2, span_ns });
+      settleView(clampView({ t0_ns: center_ns - span_ns / 2, span_ns }));
       if (notify) onUpdate();
     }
 
@@ -129,22 +148,70 @@
       focusRange(target.start_ns, target.end_ns, notify, minSpan_ns, key === 'frame' ? 1.04 : 1.4);
     }
 
-    function zoomAt(x, factor) {
-      const { layout } = layoutOf();
-      const tAnchor = tOfX(x);
-      const newSpan = state.view.span_ns * factor;
-      const newT0 = tAnchor - ((x - layout.plotLeft) / layout.plotWidth) * newSpan;
-      state.view = clampView({ t0_ns: newT0, span_ns: newSpan });
-      onUpdate();
+    /* ---------- 平滑缩放 ---------- */
+
+    /* 每帧往目标走 32%，十来帧收敛，肉眼看就是滑过去的。
+     * 跨度按比例插值（缩放是乘性的），中心按线性插值，光标底下的点才不会漂。 */
+    const SMOOTHING = 0.32;
+
+    let rafId = null;
+
+    function stepTowardsView(current, target, k) {
+      const span_ns = current.span_ns * Math.pow(target.span_ns / current.span_ns, k);
+      const centerNow = current.t0_ns + current.span_ns / 2;
+      const centerTarget = target.t0_ns + target.span_ns / 2;
+      const center = centerNow + (centerTarget - centerNow) * k;
+      return { t0_ns: center - span_ns / 2, span_ns };
     }
 
-    function zoomCenter(factor) {
-      const rect = canvas.getBoundingClientRect();
-      zoomAt(rect.width * 0.5, factor);
+    function animateStep() {
+      rafId = null;
+      if (!state.isAnimating) return;
+
+      const spanRatio = Math.abs(Math.log(state.targetView.span_ns / state.view.span_ns));
+      const panRatio = Math.abs(state.targetView.t0_ns - state.view.t0_ns) / state.view.span_ns;
+
+      if (spanRatio < 0.004 && panRatio < 0.004) {
+        state.view = { ...state.targetView };
+        state.isAnimating = false;
+        onUpdate();
+        return;
+      }
+
+      state.view = stepTowardsView(state.view, state.targetView, SMOOTHING);
+      onUpdate();
+      rafId = requestAnimationFrame(animateStep);
+    }
+
+    function startAnimation() {
+      state.isAnimating = true;
+      if (rafId === null) rafId = requestAnimationFrame(animateStep);
+    }
+
+    function settleView(view) {
+      state.isAnimating = false;
+      state.view = { ...view };
+      state.targetView = { ...view };
+    }
+
+    function zoomAt(x, factor, isSmooth) {
+      const layout = layoutOf();
+      const tAnchor = tOfX(x);
+      /* 锚点从目标视口算：动画还没追上时连滚，光标底下才不会漂 */
+      const newSpan = state.targetView.span_ns * factor;
+      const newT0 = tAnchor - ((x - layout.plotLeft) / layout.plotWidth) * newSpan;
+      state.targetView = clampView({ t0_ns: newT0, span_ns: newSpan });
+
+      if (isSmooth) startAnimation();
+      else settleView(state.targetView), onUpdate();
+    }
+
+    function zoomCenter(factor, isSmooth) {
+      zoomAt(canvasWidth * 0.5, factor, isSmooth);
     }
 
     function panBy_ns(dt_ns) {
-      state.view = clampView({ t0_ns: state.view.t0_ns + dt_ns, span_ns: state.view.span_ns });
+      settleView(clampView({ t0_ns: state.view.t0_ns + dt_ns, span_ns: state.view.span_ns }));
       onUpdate();
     }
 
@@ -155,9 +222,17 @@
 
     /* ---------- 画布事件 ---------- */
 
+    /* offsetX 是浏览器随事件一起算好的，读它不触发任何重排 */
     function localX(event) {
-      return event.clientX - canvas.getBoundingClientRect().left;
+      return event.offsetX;
     }
+
+    /* 缩略图只在长条上找位置，宽度同样交给 ResizeObserver 喂 */
+    let overviewWidth = 0;
+    const overviewWatcher = new ResizeObserver((entries) => {
+      overviewWidth = entries[0].contentRect.width;
+    });
+    overviewWatcher.observe(overview);
 
     let wheelPrev_ms = 0;
     let wheelBurst = 1;
@@ -182,12 +257,14 @@
         /* 触控板捏合会被浏览器伪装成按住 ctrl 的滚轮，delta 只有个位数。
          * 用滚轮的系数去乘，捏十下才动 15%，手上一片死区——这就是"缩放卡住"的来源。 */
         const gain = event.ctrlKey ? 0.012 : 0.0019 * wheelBurst;
-        zoomAt(localX(event), Math.exp(delta * gain));
+        zoomAt(localX(event), Math.exp(delta * gain), true);
       },
       { passive: false }
     );
 
     canvas.addEventListener('pointerdown', (event) => {
+      /* 手一按下去就停下正在滑的动画，不然拖拽会跟残余动画抢视口 */
+      state.isAnimating = false;
       const x = localX(event);
 
       if (event.shiftKey) {
@@ -214,10 +291,10 @@
       state.cursor_ns = tOfX(x);
 
       if (state.isPanning) {
-        const { layout } = layoutOf();
+        const layout = layoutOf();
         const dx = x - state.panStartX;
         const dt_ns = -(dx / layout.plotWidth) * state.view.span_ns;
-        state.view = clampView({ t0_ns: state.panStartT0_ns + dt_ns, span_ns: state.view.span_ns });
+        settleView(clampView({ t0_ns: state.panStartT0_ns + dt_ns, span_ns: state.view.span_ns }));
       } else if (state.measureAnchor_ns !== null) {
         state.marks = [state.measureAnchor_ns, clamp(state.cursor_ns, 0, state.timeline.duration_ns)];
       }
@@ -253,9 +330,9 @@
       } else if (event.key === 'ArrowRight') {
         panBy_ns(step);
       } else if (event.key === 'ArrowUp' || event.key === '+') {
-        zoomCenter(1 / 1.35);
+        zoomCenter(1 / 1.35, true);
       } else if (event.key === 'ArrowDown' || event.key === '-') {
-        zoomCenter(1.35);
+        zoomCenter(1.35, true);
       } else if (event.key === '0') {
         fitAll();
       } else {
@@ -267,8 +344,7 @@
     /* ---------- 缩略图事件 ---------- */
 
     function overviewTimeAt(event) {
-      const rect = overview.getBoundingClientRect();
-      const rel = (event.clientX - rect.left - 2) / Math.max(1, rect.width - 4);
+      const rel = (event.offsetX - 2) / Math.max(1, overviewWidth - 4);
       return clamp(rel, 0, 1) * state.timeline.duration_ns;
     }
 
@@ -291,7 +367,7 @@
       };
 
       if (!isInside) {
-        state.view = clampView({ t0_ns: t_ns - span_ns / 2, span_ns });
+        settleView(clampView({ t0_ns: t_ns - span_ns / 2, span_ns }));
       }
       onUpdate();
     });
@@ -299,13 +375,12 @@
     overview.addEventListener('pointermove', (event) => {
       const drag = state.overviewDrag;
       if (!drag) return;
-      const rect = overview.getBoundingClientRect();
-      const pxPer_ns = (rect.width - 4) / state.timeline.duration_ns;
+      const pxPer_ns = (overviewWidth - 4) / state.timeline.duration_ns;
       const dx = event.clientX - drag.startX;
       const t0_ns = drag.isInside
         ? drag.startT0_ns + dx / pxPer_ns
         : overviewTimeAt(event) - drag.grabOffset_ns;
-      state.view = clampView({ t0_ns, span_ns: state.view.span_ns });
+      settleView(clampView({ t0_ns, span_ns: state.view.span_ns }));
       onUpdate();
     });
 
@@ -329,7 +404,7 @@
       getMarks: () => state.marks.slice(),
       getTimeline: () => state.timeline,
       setViewSpan: (span_ns) => {
-        state.view = clampView({ ...state.view, span_ns });
+        settleView(clampView({ ...state.view, span_ns }));
         onUpdate();
       },
     };

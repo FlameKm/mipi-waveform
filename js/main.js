@@ -57,11 +57,20 @@
 
   /* ---------- 画布与像素比 ---------- */
 
+  /* 尺寸由 ResizeObserver 报上来，别每帧去问布局——问一次就可能强制同步重排一次 */
+  const canvasSize = new WeakMap();
+
   function prepareCanvas(canvas) {
     const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    const width = Math.max(1, Math.round(rect.width));
-    const height = Math.max(1, Math.round(rect.height));
+    let size = canvasSize.get(canvas);
+    if (!size) {
+      const rect = canvas.getBoundingClientRect();
+      size = { width: Math.max(1, Math.round(rect.width)), height: Math.max(1, Math.round(rect.height)) };
+      canvasSize.set(canvas, size);
+    }
+
+    const width = size.width;
+    const height = size.height;
     const pixelWidth = Math.round(width * dpr);
     const pixelHeight = Math.round(height * dpr);
 
@@ -328,7 +337,16 @@
   rebuild();
   bindJumpButtons();
 
-  const resizeObserver = new ResizeObserver(requestDraw);
+  const resizeObserver = new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      const rect = entry.contentRect;
+      canvasSize.set(entry.target, {
+        width: Math.max(1, Math.round(rect.width)),
+        height: Math.max(1, Math.round(rect.height)),
+      });
+    }
+    requestDraw();
+  });
   resizeObserver.observe(dom.scope);
   resizeObserver.observe(dom.overview);
 
